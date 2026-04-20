@@ -1,8 +1,7 @@
-
 import io
 import re
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import pandas as pd
 import plotly.express as px
@@ -136,17 +135,20 @@ def to_share_value(value):
     return v / 100 if v > 1 else v
 
 
-def fmt_money(value, suffix: str = "B") -> str:
+def fmt_money(value) -> str:
     if value is None or pd.isna(value):
         return "N/A"
-    return f"${float(value):,.1f}{suffix}"
+    value = float(value)
+    if abs(value) < 1:
+        return f"${value * 1000:,.0f}M"
+    return f"${value:,.2f}B"
 
 
 def fmt_pct(value) -> str:
     if value is None or pd.isna(value):
         return "N/A"
     value = float(value)
-    if value <= 1:
+    if abs(value) <= 1:
         return f"{value * 100:.1f}%"
     return f"{value:.1f}%"
 
@@ -166,26 +168,13 @@ def format_portfolio_table(df: pd.DataFrame) -> pd.DataFrame:
     return display_df
 
 
-def workbook_cache_key(source: Union[Path, io.BytesIO, bytes]) -> str:
-    if isinstance(source, Path):
-        return f"path:{source.resolve()}"
-    if isinstance(source, io.BytesIO):
-        return f"bytes:{hash(source.getvalue())}"
-    if isinstance(source, bytes):
-        return f"bytes:{hash(source)}"
-    return str(source)
-
-
 @st.cache_data
 def read_sheet_with_detected_header(
     workbook_bytes: bytes,
     sheet_name: str,
     search_terms: Optional[List[str]] = None,
-    search_rows: int = 15,
+    search_rows: int = 20,
 ) -> pd.DataFrame:
-    """
-    Detect the header row by scanning the first few rows for expected terms.
-    """
     if search_terms is None:
         search_terms = ["Company"]
 
@@ -204,15 +193,12 @@ def read_sheet_with_detected_header(
 
 
 @st.cache_data
-def load_data(workbook_bytes: bytes):
+def load_workbook_data(workbook_bytes: bytes):
     raw_data = read_sheet_with_detected_header(workbook_bytes, "Raw_Data", ["Company"])
-    assumptions = read_sheet_with_detected_header(workbook_bytes, "Assumptions", ["Company"])
-    scenario_model = read_sheet_with_detected_header(
-        workbook_bytes, "Scenario_Model", ["Company", "Scenario"]
-    )
-    revenue_mix = read_sheet_with_detected_header(workbook_bytes, "Revenue_Mix", ["Company"])
+    assumptions = read_sheet_with_detected_header(workbook_bytes, "Assumptions", ["Company", "Scenario"])
+    revenue_mix_raw = read_sheet_with_detected_header(workbook_bytes, "Revenue_Mix", ["Company"])
     sources = read_sheet_with_detected_header(workbook_bytes, "Sources", ["Company"])
-    return raw_data, assumptions, scenario_model, revenue_mix, sources
+    return raw_data, assumptions, revenue_mix_raw, sources
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -243,15 +229,11 @@ def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
-def find_mix_col(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
-    if df.empty:
-        return None
-
-    keyword_keys = [normalize_key(k) for k in keywords]
-
+def find_secondary_company_col(df: pd.DataFrame, primary_company_col: Optional[str]) -> Optional[str]:
     for col in df.columns:
-        col_key = normalize_key(col)
-        if all(k in col_key for k in keyword_keys):
+        if primary_company_col and col == primary_company_col:
+            continue
+        if normalize_key(col).startswith("company"):
             return col
     return None
 
@@ -276,53 +258,140 @@ def keep_valid_companies(df: pd.DataFrame, company_col: Optional[str], valid_com
     return cleaned.loc[mask].copy()
 
 
-def score_companies(
-    portfolio_df: pd.DataFrame,
-    company_col: str,
-    revenue_2025_col: Optional[str],
-    net_2027_col: Optional[str],
-    ai_up_2027_col: Optional[str],
-    can_2027_col: Optional[str],
-) -> pd.DataFrame:
-    scored = portfolio_df.copy()
+def build_interpretation_map(
+    revenue_mix_raw: pd.DataFrame,
+    primary_company_col: Optional[str],
+) -> dict[str, str]:
+    interpretation_col = find_col(revenue_mix_raw, ["Interpretation"])
+    secondary_company_col = find_secondary_company_col(revenue_mix_raw, primary_company_col)
 
-    scored["Revenue_2025_Calc"] = to_num_series(scored[revenue_2025_col]) if revenue_2025_col else pd.NA
-    scored["Net_2027_Calc"] = to_num_series(scored[net_2027_col]) if net_2027_col else pd.NA
-    scored["AI_Uplift_2027_Calc"] = to_num_series(scored[ai_up_2027_col]) if ai_up_2027_col else pd.NA
-    scored["Cannibalization_2027_Calc"] = (
-        to_num_series(scored[can_2027_col]) if can_2027_col else pd.NA
+    if not interpretation_col or not secondary_company_col:
+        return {}
+
+    interp_df = revenue_mix_raw[[secondary_company_col, interpretation_col]].copy()
+    interp_df = interp_df.dropna(subset=[secondary_company_col, interpretation_col])
+    interp_df[secondary_company_col] = normalize_company_series(interp_df[secondary_company_col])
+
+    return dict(zip(interp_df[secondary_company_col], interp_df[interpretation_col].astype(str)))
+
+
+def calculate_scenario_model(raw_data: pd.DataFrame, assumptions: pd.DataFrame, selected_scenario: str) -> pd.DataFrame:
+    raw_company_col = find_col(raw_data, ["Company"])
+    ass_company_col = find_col(assumptions, ["Company"])
+    ass_scenario_col = find_col(assumptions, ["Scenario"])
+
+    revenue_col = find_col(raw_data, ["Revenue_2025_USD_Bn", "Revenue_2025", "Revenue 2025"])
+    existing_ai_share_col = find_col(
+        raw_data,
+        ["Existing_AI_Revenue_Share_2025_%", "Existing AI Revenue Share 2025 %", "AI Share 2025"],
     )
 
-    scored["Growth_2025_2027_Pct"] = pd.NA
-    valid_mask = (
-        scored["Revenue_2025_Calc"].notna()
-        & scored["Net_2027_Calc"].notna()
-        & (scored["Revenue_2025_Calc"] != 0)
-    )
-    scored.loc[valid_mask, "Growth_2025_2027_Pct"] = (
-        scored.loc[valid_mask, "Net_2027_Calc"] / scored.loc[valid_mask, "Revenue_2025_Calc"] - 1
-    )
+    if not raw_company_col or not ass_company_col or not ass_scenario_col or not revenue_col:
+        return pd.DataFrame()
 
-    scored["Risk_Score"] = pd.NA
-    valid_risk = (
-        scored["AI_Uplift_2027_Calc"].notna()
-        & scored["Cannibalization_2027_Calc"].notna()
-        & (scored["AI_Uplift_2027_Calc"] > 0)
-    )
-    scored.loc[valid_risk, "Risk_Score"] = (
-        scored.loc[valid_risk, "Cannibalization_2027_Calc"]
-        / scored.loc[valid_risk, "AI_Uplift_2027_Calc"]
-    ).round(3)
-
-    return scored[
-        [
-            company_col,
-            "Growth_2025_2027_Pct",
-            "AI_Uplift_2027_Calc",
-            "Cannibalization_2027_Calc",
-            "Risk_Score",
-        ]
+    ass_filtered = assumptions[
+        normalize_company_series(assumptions[ass_scenario_col]) == selected_scenario.lower()
     ].copy()
+
+    col_map = {
+        "Baseline_Growth_2026_%": find_col(ass_filtered, ["Baseline_Growth_2026_%", "Base_Growth_2026_%"]),
+        "Baseline_Growth_2027_%": find_col(ass_filtered, ["Baseline_Growth_2027_%", "Base_Growth_2027_%"]),
+        "AI_Exposed_Revenue_%": find_col(ass_filtered, ["AI_Exposed_Revenue_%", "AI_Exposed_%"]),
+        "AI_Adoption_2026_%": find_col(ass_filtered, ["AI_Adoption_2026_%", "Adoption_2026_%"]),
+        "AI_Adoption_2027_%": find_col(ass_filtered, ["AI_Adoption_2027_%", "Adoption_2027_%"]),
+        "Monetization_Yield_2026_%": find_col(
+            ass_filtered, ["Monetization_Yield_2026_%", "Monetization_2026_%"]
+        ),
+        "Monetization_Yield_2027_%": find_col(
+            ass_filtered, ["Monetization_Yield_2027_%", "Monetization_2027_%"]
+        ),
+        "Cannibalization_2026_%": find_col(ass_filtered, ["Cannibalization_2026_%"]),
+        "Cannibalization_2027_%": find_col(ass_filtered, ["Cannibalization_2027_%"]),
+    }
+
+    base = raw_data.copy()
+    base[raw_company_col] = base[raw_company_col].astype(str).str.strip()
+
+    ass_subset_cols = [ass_company_col] + [v for v in col_map.values() if v]
+    ass_subset = ass_filtered[ass_subset_cols].copy()
+    ass_subset[ass_company_col] = ass_subset[ass_company_col].astype(str).str.strip()
+
+    merged = base.merge(ass_subset, left_on=raw_company_col, right_on=ass_company_col, how="left")
+    if ass_company_col in merged.columns and ass_company_col != raw_company_col:
+        merged = merged.drop(columns=[ass_company_col])
+
+    merged["Revenue_2025"] = to_num_series(merged[revenue_col])
+    merged["Existing_AI_Revenue_Share_2025_%"] = (
+        merged[existing_ai_share_col].fillna(0).apply(to_share_value) if existing_ai_share_col else 0
+    )
+
+    for target, source in col_map.items():
+        if source:
+            merged[target] = to_num_series(merged[source])
+        else:
+            merged[target] = 0
+
+    merged["Revenue_2026_Baseline"] = merged["Revenue_2025"] * (1 + merged["Baseline_Growth_2026_%"])
+    merged["AI_Base_2026"] = merged["Revenue_2026_Baseline"] * merged["AI_Exposed_Revenue_%"]
+    merged["AI_Uplift_2026"] = (
+        merged["AI_Base_2026"] * merged["AI_Adoption_2026_%"] * merged["Monetization_Yield_2026_%"]
+    )
+    merged["Cannibalization_2026"] = merged["AI_Base_2026"] * merged["Cannibalization_2026_%"]
+    merged["Net_Revenue_2026"] = (
+        merged["Revenue_2026_Baseline"] + merged["AI_Uplift_2026"] - merged["Cannibalization_2026"]
+    )
+
+    merged["Revenue_2027_Baseline"] = merged["Net_Revenue_2026"] * (1 + merged["Baseline_Growth_2027_%"])
+    merged["AI_Base_2027"] = merged["Revenue_2027_Baseline"] * merged["AI_Exposed_Revenue_%"]
+    merged["AI_Uplift_2027"] = (
+        merged["AI_Base_2027"] * merged["AI_Adoption_2027_%"] * merged["Monetization_Yield_2027_%"]
+    )
+    merged["Cannibalization_2027"] = merged["AI_Base_2027"] * merged["Cannibalization_2027_%"]
+    merged["Net_Revenue_2027"] = (
+        merged["Revenue_2027_Baseline"] + merged["AI_Uplift_2027"] - merged["Cannibalization_2027"]
+    )
+
+    merged["Growth_2025_2027_Pct"] = pd.NA
+    valid_growth = merged["Revenue_2025"].notna() & merged["Net_Revenue_2027"].notna() & (merged["Revenue_2025"] != 0)
+    merged.loc[valid_growth, "Growth_2025_2027_Pct"] = (
+        merged.loc[valid_growth, "Net_Revenue_2027"] / merged.loc[valid_growth, "Revenue_2025"] - 1
+    )
+
+    merged["Risk_Score"] = pd.NA
+    valid_risk = merged["AI_Uplift_2027"].notna() & merged["Cannibalization_2027"].notna() & (merged["AI_Uplift_2027"] > 0)
+    merged.loc[valid_risk, "Risk_Score"] = (
+        merged.loc[valid_risk, "Cannibalization_2027"] / merged.loc[valid_risk, "AI_Uplift_2027"]
+    )
+
+    return merged
+
+
+def calculate_revenue_mix(
+    scenario_df: pd.DataFrame,
+    company_col: str,
+    interpretation_map: dict[str, str],
+) -> pd.DataFrame:
+    mix = scenario_df[[company_col, "Existing_AI_Revenue_Share_2025_%", "AI_Uplift_2026", "Net_Revenue_2026", "AI_Uplift_2027", "Net_Revenue_2027"]].copy()
+    mix = mix.rename(columns={"Existing_AI_Revenue_Share_2025_%": "AI_Share_2025_%"}).copy()
+
+    uplift_share_2026 = pd.Series(0.0, index=mix.index)
+    uplift_share_2027 = pd.Series(0.0, index=mix.index)
+
+    valid_2026 = mix["Net_Revenue_2026"].notna() & (mix["Net_Revenue_2026"] != 0)
+    valid_2027 = mix["Net_Revenue_2027"].notna() & (mix["Net_Revenue_2027"] != 0)
+
+    uplift_share_2026.loc[valid_2026] = mix.loc[valid_2026, "AI_Uplift_2026"] / mix.loc[valid_2026, "Net_Revenue_2026"]
+    uplift_share_2027.loc[valid_2027] = mix.loc[valid_2027, "AI_Uplift_2027"] / mix.loc[valid_2027, "Net_Revenue_2027"]
+
+    mix["Legacy_Share_2025_%"] = 1 - mix["AI_Share_2025_%"]
+    mix["AI_Share_2026_%"] = (mix["AI_Share_2025_%"] + uplift_share_2026).clip(upper=1)
+    mix["Legacy_Share_2026_%"] = 1 - mix["AI_Share_2026_%"]
+    mix["AI_Share_2027_%"] = (mix["AI_Share_2025_%"] + uplift_share_2026 + uplift_share_2027).clip(upper=1)
+    mix["Legacy_Share_2027_%"] = 1 - mix["AI_Share_2027_%"]
+    mix["Shift_in_AI_Share_2027_vs_2025_%"] = mix["AI_Share_2027_%"] - mix["AI_Share_2025_%"]
+    mix["Interpretation"] = normalize_company_series(mix[company_col]).map(interpretation_map)
+
+    return mix
 
 
 def render_rank_card(
@@ -383,22 +452,22 @@ else:
     workbook_bytes = DEFAULT_WORKBOOK_PATH.read_bytes()
     workbook_label = DEFAULT_WORKBOOK_PATH.name
 
-raw_data, assumptions, scenario_model, revenue_mix, sources = load_data(workbook_bytes)
+try:
+    raw_data, assumptions, revenue_mix_raw, sources = load_workbook_data(workbook_bytes)
+except Exception as exc:
+    st.error(f"Could not read the workbook. Please check sheet names and structure. Error: {exc}")
+    st.stop()
+
 raw_data = normalize_columns(raw_data)
 assumptions = normalize_columns(assumptions)
-scenario_model = normalize_columns(scenario_model)
-revenue_mix = normalize_columns(revenue_mix)
+revenue_mix_raw = normalize_columns(revenue_mix_raw)
 sources = normalize_columns(sources)
 
-# Column detection
 raw_company_col = find_col(raw_data, ["Company"])
-scenario_company_col = find_col(scenario_model, ["Company"])
-scenario_name_col = find_col(scenario_model, ["Scenario"])
-mix_company_col = find_col(revenue_mix, ["Company"])
 source_company_col = find_col(sources, ["Company"])
 
-if raw_company_col is None or scenario_company_col is None:
-    st.error("Could not find required company columns in the workbook.")
+if raw_company_col is None:
+    st.error("Could not find a Company column in Raw_Data.")
     st.stop()
 
 company_list = sorted(
@@ -407,9 +476,6 @@ company_list = sorted(
 valid_company_keys = {company.strip().lower() for company in company_list}
 
 raw_data = keep_valid_companies(raw_data, raw_company_col, valid_company_keys)
-scenario_model = keep_valid_companies(scenario_model, scenario_company_col, valid_company_keys)
-if mix_company_col:
-    revenue_mix = keep_valid_companies(revenue_mix, mix_company_col, valid_company_keys)
 if source_company_col:
     sources = keep_valid_companies(sources, source_company_col, valid_company_keys)
 
@@ -417,66 +483,46 @@ company_list = sorted(
     raw_data[raw_company_col].dropna().astype(str).str.strip().unique().tolist()
 )
 
-rev2025_col = find_col(scenario_model, ["Revenue_2025_USD_Bn", "Revenue_2025", "Revenue 2025"])
-net2026_col = find_col(scenario_model, ["Net_Revenue_2026_USD_Bn", "Net_Revenue_2026", "Net Revenue 2026"])
-net2027_col = find_col(scenario_model, ["Net_Revenue_2027_USD_Bn", "Net_Revenue_2027", "Net Revenue 2027"])
-ai_up_2026_col = find_col(scenario_model, ["AI_Uplift_2026_USD_Bn", "AI_Uplift_2026", "AI Uplift 2026"])
-ai_up_2027_col = find_col(scenario_model, ["AI_Uplift_2027_USD_Bn", "AI_Uplift_2027", "AI Uplift 2027"])
-can_2026_col = find_col(scenario_model, ["Cannibalization_2026_USD_Bn", "Cannibalization_2026", "Cannibalization 2026"])
-can_2027_col = find_col(scenario_model, ["Cannibalization_2027_USD_Bn", "Cannibalization_2027", "Cannibalization 2027"])
-
-segment_name_cols = [c for c in raw_data.columns if "segment" in c.lower() and "name" in c.lower()]
-segment_value_cols = [c for c in raw_data.columns if "segment" in c.lower() and "revenue" in c.lower()]
-ai_product_col = find_col(raw_data, ["Main_AI_Products", "AI_Products", "Main AI Products"])
-monetization_col = find_col(raw_data, ["AI_Monetization_Model", "Monetization", "AI Monetization Model"])
-
-# Revenue mix: supports AI + Legacy/Core
-ai_share_2025_col = find_mix_col(revenue_mix, ["ai", "2025"])
-ai_share_2027_col = find_mix_col(revenue_mix, ["ai", "2027"])
-core_share_2025_col = find_mix_col(revenue_mix, ["core", "2025"]) or find_mix_col(revenue_mix, ["legacy", "2025"])
-core_share_2027_col = find_mix_col(revenue_mix, ["core", "2027"]) or find_mix_col(revenue_mix, ["legacy", "2027"])
-insight_col = find_col(revenue_mix, ["Insight", "Interpretation", "Comment", "Observation", "Revenue_Mix_Comment"])
-
 selected_company = st.sidebar.selectbox("Company", company_list)
 selected_scenario = st.sidebar.selectbox("Scenario", SCENARIO_ORDER, index=1)
 
-# Filters
-scenario_filtered_all = scenario_model.copy()
-if scenario_name_col and scenario_name_col in scenario_filtered_all.columns:
-    scenario_filtered_all = scenario_filtered_all[
-        scenario_filtered_all[scenario_name_col].astype(str).str.strip().str.lower() == selected_scenario.lower()
-    ]
+interpretation_map = build_interpretation_map(revenue_mix_raw, find_col(revenue_mix_raw, ["Company"]))
+
+scenario_model = calculate_scenario_model(raw_data, assumptions, selected_scenario)
+if scenario_model.empty:
+    st.error("Could not calculate scenario outputs from Raw_Data and Assumptions.")
+    st.stop()
+
+scenario_company_col = find_col(scenario_model, ["Company"])
+revenue_mix = calculate_revenue_mix(scenario_model, scenario_company_col, interpretation_map)
 
 raw_company = raw_data[
     normalize_company_series(raw_data[raw_company_col]) == selected_company.strip().lower()
-]
+].copy()
 
-company_scenario_rows = scenario_model[
+company_scenario = scenario_model[
     normalize_company_series(scenario_model[scenario_company_col]) == selected_company.strip().lower()
-]
+].copy()
 
-company_scenario = company_scenario_rows.copy()
-if scenario_name_col and scenario_name_col in company_scenario.columns:
-    company_scenario = company_scenario[
-        normalize_company_series(company_scenario[scenario_name_col]) == selected_scenario.lower()
+mix_company_col = find_col(revenue_mix, ["Company"])
+mix_company = revenue_mix[
+    normalize_company_series(revenue_mix[mix_company_col]) == selected_company.strip().lower()
+].copy()
+
+portfolio_scored = scenario_model[
+    [
+        scenario_company_col,
+        "Growth_2025_2027_Pct",
+        "AI_Uplift_2027",
+        "Cannibalization_2027",
+        "Risk_Score",
     ]
-if company_scenario.empty:
-    company_scenario = company_scenario_rows.head(1)
-
-mix_company = pd.DataFrame()
-if mix_company_col and mix_company_col in revenue_mix.columns:
-    mix_company = revenue_mix[
-        normalize_company_series(revenue_mix[mix_company_col]) == selected_company.strip().lower()
-    ]
-
-# Portfolio calculations
-portfolio_scored = score_companies(
-    scenario_filtered_all,
-    scenario_company_col,
-    rev2025_col,
-    net2027_col,
-    ai_up_2027_col,
-    can_2027_col,
+].copy()
+portfolio_scored = portfolio_scored.rename(
+    columns={
+        "AI_Uplift_2027": "AI_Uplift_2027_Calc",
+        "Cannibalization_2027": "Cannibalization_2027_Calc",
+    }
 )
 
 winner_company = "N/A"
@@ -493,16 +539,9 @@ if not portfolio_scored.empty and portfolio_scored["Risk_Score"].notna().any():
     risk_company = str(risk_row[scenario_company_col])
     risk_score = risk_row["Risk_Score"]
 
-portfolio_revenue_2025 = None
-portfolio_revenue_2027 = None
-portfolio_ai_uplift_2027 = None
-
-if rev2025_col and rev2025_col in scenario_filtered_all.columns:
-    portfolio_revenue_2025 = to_num_series(scenario_filtered_all[rev2025_col]).sum(min_count=1)
-if net2027_col and net2027_col in scenario_filtered_all.columns:
-    portfolio_revenue_2027 = to_num_series(scenario_filtered_all[net2027_col]).sum(min_count=1)
-if ai_up_2027_col and ai_up_2027_col in scenario_filtered_all.columns:
-    portfolio_ai_uplift_2027 = to_num_series(scenario_filtered_all[ai_up_2027_col]).sum(min_count=1)
+portfolio_revenue_2025 = scenario_model["Revenue_2025"].sum(min_count=1)
+portfolio_revenue_2027 = scenario_model["Net_Revenue_2027"].sum(min_count=1)
+portfolio_ai_uplift_2027 = scenario_model["AI_Uplift_2027"].sum(min_count=1)
 
 # -----------------------------
 # Portfolio header metrics
@@ -513,8 +552,8 @@ with m1:
 with m2:
     delta_display = None
     if (
-        portfolio_revenue_2025 is not None and pd.notna(portfolio_revenue_2025)
-        and portfolio_revenue_2027 is not None and pd.notna(portfolio_revenue_2027)
+        pd.notna(portfolio_revenue_2025)
+        and pd.notna(portfolio_revenue_2027)
         and float(portfolio_revenue_2025) != 0
     ):
         delta_display = f"{((float(portfolio_revenue_2027) / float(portfolio_revenue_2025)) - 1) * 100:.1f}% vs 2025"
@@ -589,44 +628,38 @@ with tab1:
 
     with row1_left:
         st.markdown("<div class='section-title'>Revenue outlook</div>", unsafe_allow_html=True)
-        if scenario_company_col and rev2025_col and net2027_col:
-            chart_df = scenario_filtered_all[[scenario_company_col, rev2025_col, net2027_col]].copy()
-            chart_df.columns = ["Company", "Revenue 2025", "Net Revenue 2027"]
-            chart_df["Revenue 2025"] = to_num_series(chart_df["Revenue 2025"])
-            chart_df["Net Revenue 2027"] = to_num_series(chart_df["Net Revenue 2027"])
+        chart_df = scenario_model[[scenario_company_col, "Revenue_2025", "Net_Revenue_2027"]].copy()
+        chart_df.columns = ["Company", "Revenue 2025", "Net Revenue 2027"]
 
-            fig_compare = go.Figure()
-            fig_compare.add_bar(name="2025", x=chart_df["Company"], y=chart_df["Revenue 2025"])
-            fig_compare.add_bar(name="2027", x=chart_df["Company"], y=chart_df["Net Revenue 2027"])
-            fig_compare.update_layout(
-                barmode="group",
-                height=420,
-                title=f"2025 vs 2027 revenue ({selected_scenario} scenario)",
-                legend_title_text="",
-                margin=dict(l=10, r=10, t=50, b=10),
-            )
-            st.plotly_chart(fig_compare, use_container_width=True)
+        fig_compare = go.Figure()
+        fig_compare.add_bar(name="2025", x=chart_df["Company"], y=chart_df["Revenue 2025"])
+        fig_compare.add_bar(name="2027", x=chart_df["Company"], y=chart_df["Net Revenue 2027"])
+        fig_compare.update_layout(
+            barmode="group",
+            height=420,
+            title=f"2025 vs 2027 revenue ({selected_scenario} scenario)",
+            legend_title_text="",
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+        st.plotly_chart(fig_compare, use_container_width=True)
 
     with row1_right:
         st.markdown("<div class='section-title'>AI uplift vs downside</div>", unsafe_allow_html=True)
-        if scenario_company_col and ai_up_2027_col and can_2027_col:
-            impact_df = scenario_filtered_all[[scenario_company_col, ai_up_2027_col, can_2027_col]].copy()
-            impact_df.columns = ["Company", "AI Uplift 2027", "Cannibalization 2027"]
-            impact_df["AI Uplift 2027"] = to_num_series(impact_df["AI Uplift 2027"])
-            impact_df["Cannibalization 2027"] = to_num_series(impact_df["Cannibalization 2027"])
-            impact_melt = impact_df.melt(id_vars="Company", var_name="Metric", value_name="Value")
+        impact_df = scenario_model[[scenario_company_col, "AI_Uplift_2027", "Cannibalization_2027"]].copy()
+        impact_df.columns = ["Company", "AI Uplift 2027", "Cannibalization 2027"]
+        impact_melt = impact_df.melt(id_vars="Company", var_name="Metric", value_name="Value")
 
-            fig_impact = px.bar(
-                impact_melt,
-                x="Company",
-                y="Value",
-                color="Metric",
-                barmode="group",
-                height=420,
-                title="2027 AI uplift compared with cannibalization",
-            )
-            fig_impact.update_layout(margin=dict(l=10, r=10, t=50, b=10), legend_title_text="")
-            st.plotly_chart(fig_impact, use_container_width=True)
+        fig_impact = px.bar(
+            impact_melt,
+            x="Company",
+            y="Value",
+            color="Metric",
+            barmode="group",
+            height=420,
+            title="2027 AI uplift compared with cannibalization",
+        )
+        fig_impact.update_layout(margin=dict(l=10, r=10, t=50, b=10), legend_title_text="")
+        st.plotly_chart(fig_impact, use_container_width=True)
 
     row2_left, row2_right = st.columns([1.1, 1.2])
 
@@ -646,27 +679,22 @@ with tab1:
 
     with row2_right:
         st.markdown("<div class='section-title'>Revenue mix shift</div>", unsafe_allow_html=True)
-        if mix_company_col and ai_share_2025_col and ai_share_2027_col:
-            mix_chart_df = revenue_mix[[mix_company_col, ai_share_2025_col, ai_share_2027_col]].copy()
-            mix_chart_df.columns = ["Company", "AI Share 2025", "AI Share 2027"]
-            mix_chart_df["AI Share 2025"] = mix_chart_df["AI Share 2025"].apply(to_share_value)
-            mix_chart_df["AI Share 2027"] = mix_chart_df["AI Share 2027"].apply(to_share_value)
-            mix_long = mix_chart_df.melt(id_vars="Company", var_name="Period", value_name="AI Share")
+        mix_chart_df = revenue_mix[[mix_company_col, "AI_Share_2025_%", "AI_Share_2027_%"]].copy()
+        mix_chart_df.columns = ["Company", "AI Share 2025", "AI Share 2027"]
+        mix_long = mix_chart_df.melt(id_vars="Company", var_name="Period", value_name="AI Share")
 
-            fig_mix = px.bar(
-                mix_long,
-                x="Company",
-                y="AI Share",
-                color="Period",
-                barmode="group",
-                height=420,
-                title="AI share of revenue: 2025 vs 2027",
-            )
-            fig_mix.update_yaxes(tickformat=".0%")
-            fig_mix.update_layout(margin=dict(l=10, r=10, t=50, b=10), legend_title_text="")
-            st.plotly_chart(fig_mix, use_container_width=True)
-        else:
-            st.info("Revenue mix columns were not found in the workbook.")
+        fig_mix = px.bar(
+            mix_long,
+            x="Company",
+            y="AI Share",
+            color="Period",
+            barmode="group",
+            height=420,
+            title="AI share of revenue: 2025 vs 2027",
+        )
+        fig_mix.update_yaxes(tickformat=".0%")
+        fig_mix.update_layout(margin=dict(l=10, r=10, t=50, b=10), legend_title_text="")
+        st.plotly_chart(fig_mix, use_container_width=True)
 
 # -----------------------------
 # Tab 2: Company Deep Dive
@@ -677,9 +705,9 @@ with tab2:
     top_left, top_mid, top_right = st.columns(3)
     row = company_scenario.iloc[0] if not company_scenario.empty else pd.Series(dtype=object)
 
-    rev2025_value = parse_number(row.get(rev2025_col))
-    net2026_value = parse_number(row.get(net2026_col))
-    net2027_value = parse_number(row.get(net2027_col))
+    rev2025_value = parse_number(row.get("Revenue_2025"))
+    net2026_value = parse_number(row.get("Net_Revenue_2026"))
+    net2027_value = parse_number(row.get("Net_Revenue_2027"))
 
     with top_left:
         st.metric("2025 Revenue", fmt_money(rev2025_value))
@@ -698,6 +726,12 @@ with tab2:
 
     d1, d2 = st.columns([1.1, 1])
 
+    segment_name_cols = [c for c in raw_data.columns if "segment" in c.lower() and "name" in c.lower()]
+    segment_value_cols = [c for c in raw_data.columns if "segment" in c.lower() and "revenue" in c.lower()]
+    ai_product_col = find_col(raw_data, ["Main_AI_Products", "AI_Products", "Main AI Products"])
+    monetization_col = find_col(raw_data, ["AI_Monetization_Model", "Monetization", "AI Monetization Model"])
+    notes_col = find_col(raw_data, ["Notes"])
+
     with d1:
         st.markdown("<div class='section-title'>Business snapshot</div>", unsafe_allow_html=True)
         if not raw_company.empty:
@@ -709,8 +743,8 @@ with tab2:
 
             st.dataframe(raw_company[display_cols], use_container_width=True, hide_index=True)
 
-            segment_rows = []
             company_row = raw_company.iloc[0]
+            segment_rows = []
             for n_col, v_col in zip(segment_name_cols, segment_value_cols):
                 seg_name = company_row.get(n_col)
                 seg_value = parse_number(company_row.get(v_col))
@@ -723,19 +757,27 @@ with tab2:
                 fig_seg.update_layout(height=350, margin=dict(l=10, r=10, t=45, b=10))
                 st.plotly_chart(fig_seg, use_container_width=True)
 
+            if notes_col and pd.notna(company_row.get(notes_col)):
+                st.markdown(
+                    f"""
+                    <div class='subtle-card'>
+                        <div class='small-muted'>Notes</div>
+                        <div style='margin-top:0.45rem;font-size:1rem;line-height:1.55'>
+                            {company_row.get(notes_col)}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
     with d2:
         st.markdown("<div class='section-title'>AI impact profile</div>", unsafe_allow_html=True)
-        impact_rows = []
-
-        if ai_up_2026_col:
-            impact_rows.append({"Metric": "AI Uplift 2026", "Value": parse_number(row.get(ai_up_2026_col))})
-        if can_2026_col:
-            impact_rows.append({"Metric": "Cannibalization 2026", "Value": parse_number(row.get(can_2026_col))})
-        if ai_up_2027_col:
-            impact_rows.append({"Metric": "AI Uplift 2027", "Value": parse_number(row.get(ai_up_2027_col))})
-        if can_2027_col:
-            impact_rows.append({"Metric": "Cannibalization 2027", "Value": parse_number(row.get(can_2027_col))})
-
+        impact_rows = [
+            {"Metric": "AI Uplift 2026", "Value": parse_number(row.get("AI_Uplift_2026"))},
+            {"Metric": "Cannibalization 2026", "Value": parse_number(row.get("Cannibalization_2026"))},
+            {"Metric": "AI Uplift 2027", "Value": parse_number(row.get("AI_Uplift_2027"))},
+            {"Metric": "Cannibalization 2027", "Value": parse_number(row.get("Cannibalization_2027"))},
+        ]
         impact_rows = [item for item in impact_rows if pd.notna(item["Value"])]
 
         if impact_rows:
@@ -748,15 +790,21 @@ with tab2:
 
     with b1:
         st.markdown("<div class='section-title'>Scenario comparison</div>", unsafe_allow_html=True)
-        if not company_scenario_rows.empty and scenario_name_col and net2027_col:
-            scen_df = company_scenario_rows[[scenario_name_col, net2027_col]].copy()
-            scen_df.columns = ["Scenario", "Net Revenue 2027"]
-            scen_df["Net Revenue 2027"] = to_num_series(scen_df["Net Revenue 2027"])
-            if "Scenario" in scen_df.columns:
-                scen_df["Scenario"] = pd.Categorical(
-                    scen_df["Scenario"], categories=SCENARIO_ORDER, ordered=True
+        scenario_compare_rows = []
+        for scen in SCENARIO_ORDER:
+            scen_df = calculate_scenario_model(raw_data, assumptions, scen)
+            scen_company = scen_df[
+                normalize_company_series(scen_df[scenario_company_col]) == selected_company.strip().lower()
+            ]
+            if not scen_company.empty:
+                scenario_compare_rows.append(
+                    {"Scenario": scen, "Net Revenue 2027": scen_company.iloc[0]["Net_Revenue_2027"]}
                 )
-                scen_df = scen_df.sort_values("Scenario")
+
+        if scenario_compare_rows:
+            scen_df = pd.DataFrame(scenario_compare_rows)
+            scen_df["Scenario"] = pd.Categorical(scen_df["Scenario"], categories=SCENARIO_ORDER, ordered=True)
+            scen_df = scen_df.sort_values("Scenario")
 
             fig_scen = px.bar(
                 scen_df,
@@ -770,14 +818,13 @@ with tab2:
     with b2:
         st.markdown("<div class='section-title'>Revenue mix visuals</div>", unsafe_allow_html=True)
 
-        if not mix_company.empty and ai_share_2025_col and ai_share_2027_col:
+        if not mix_company.empty:
             mix_row = mix_company.iloc[0]
 
-            ai_2025 = to_share_value(mix_row.get(ai_share_2025_col))
-            ai_2027 = to_share_value(mix_row.get(ai_share_2027_col))
-
-            core_2025 = to_share_value(mix_row.get(core_share_2025_col)) if core_share_2025_col else pd.NA
-            core_2027 = to_share_value(mix_row.get(core_share_2027_col)) if core_share_2027_col else pd.NA
+            ai_2025 = to_share_value(mix_row.get("AI_Share_2025_%"))
+            ai_2027 = to_share_value(mix_row.get("AI_Share_2027_%"))
+            core_2025 = to_share_value(mix_row.get("Legacy_Share_2025_%"))
+            core_2027 = to_share_value(mix_row.get("Legacy_Share_2027_%"))
 
             if pd.isna(core_2025) and pd.notna(ai_2025):
                 core_2025 = 1 - ai_2025
@@ -809,22 +856,19 @@ with tab2:
                 )
                 st.plotly_chart(fig_company_mix, use_container_width=True)
 
-                if insight_col and insight_col in mix_company.columns and pd.notna(mix_company.iloc[0][insight_col]):
-                    st.markdown(
-                        f"""
-                        <div class='subtle-card'>
-                            <div class='small-muted'>Interpretation</div>
-                            <div style='margin-top:0.45rem;font-size:1rem;line-height:1.55'>
-                                {mix_company.iloc[0][insight_col]}
-                            </div>
+            interpretation = mix_row.get("Interpretation")
+            if pd.notna(interpretation):
+                st.markdown(
+                    f"""
+                    <div class='subtle-card'>
+                        <div class='small-muted'>Interpretation</div>
+                        <div style='margin-top:0.45rem;font-size:1rem;line-height:1.55'>
+                            {interpretation}
                         </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-            else:
-                st.info("Revenue mix row exists, but the share values could not be parsed.")
-        else:
-            st.info("Revenue mix fields were not detected for the selected company.")
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
 # -----------------------------
 # Tab 3: Sources
@@ -845,18 +889,8 @@ with tab3:
 
 with st.expander("Diagnostics"):
     st.write("Workbook loaded:", workbook_label)
-    st.write("Revenue_Mix columns detected:", revenue_mix.columns.tolist())
-    st.write(
-        "Detected AI/Core mix columns:",
-        {
-            "ai_share_2025_col": ai_share_2025_col,
-            "ai_share_2027_col": ai_share_2027_col,
-            "core_share_2025_col": core_share_2025_col,
-            "core_share_2027_col": core_share_2027_col,
-            "insight_col": insight_col,
-        },
-    )
-    st.write("Selected company:", selected_company)
-    st.write("Matching Revenue_Mix rows:", len(mix_company))
+    st.write("Selected scenario:", selected_scenario)
+    st.write("Scenario model preview:", scenario_model[[scenario_company_col, "Revenue_2025", "Net_Revenue_2027", "AI_Uplift_2027"]])
+    st.write("Revenue mix preview:", revenue_mix[[mix_company_col, "AI_Share_2025_%", "AI_Share_2027_%", "Shift_in_AI_Share_2027_vs_2025_%"]])
 
 st.caption("Run locally with: streamlit run app.py")
