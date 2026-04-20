@@ -147,10 +147,7 @@ def fmt_money(value) -> str:
 def fmt_pct(value) -> str:
     if value is None or pd.isna(value):
         return "N/A"
-    value = float(value)
-    if abs(value) <= 1:
-        return f"{value * 100:.1f}%"
-    return f"{value:.1f}%"
+    return f"{float(value) * 100:.1f}%"
 
 
 def format_portfolio_table(df: pd.DataFrame) -> pd.DataFrame:
